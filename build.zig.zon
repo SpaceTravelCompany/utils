@@ -1,0 +1,14 @@
+.{
+    .minimum_zig_version = "0.16.0",
+    .name = .thread_pool,
+    .fingerprint = 0x2b20b508023f2d40,
+    .version = "0.1.0",
+    .description = "thread_pool — ThreadPool, WorkerPool",
+    .copyright = "",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+    },
+}
