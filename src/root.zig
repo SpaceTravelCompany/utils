@@ -38,6 +38,57 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+/// Go의 sync.WaitGroup과 동일한 패턴.
+/// - `add(n)`: 카운터 n 증가
+/// - `done()`: 카운터 1 감소. 0이 되면 대기 중인 wait()을 깨움
+/// - `wait()`: 카운터가 0이 될 때까지 대기
+///
+/// 사용 예:
+/// ```zig
+/// var wg = thread_pool.WaitGroup{};
+/// wg.add(10);
+/// for (0..10) |_| {
+///     try std.Thread.spawn(.{}, struct {
+///         fn f(wg_ptr: *WaitGroup) void {
+///             defer wg_ptr.done();
+///             // 작업 수행
+///         }
+///     }.f, .{&wg});
+/// }
+/// wg.wait(); // 10개 전부 완료 시점
+/// ```
+pub const WaitGroup = struct {
+    count: std.atomic.Value(usize) = .init(0),
+    mutex: std.Io.Mutex = .init,
+    cond: std.Io.Condition = .init,
+    io_impl: std.Io.Threaded = .init_single_threaded,
+
+    pub fn add(self: *WaitGroup, n: usize) void {
+        _ = self.count.fetchAdd(n, .acq_rel);
+    }
+
+    pub fn done(self: *WaitGroup) void {
+        if (self.count.fetchSub(1, .acq_rel) == 1) {
+            // 카운터가 0이 됐으므로 대기 중인 wait를 깨움
+            self.mutex.lockUncancelable(self.io());
+            self.cond.broadcast(self.io());
+            self.mutex.unlock(self.io());
+        }
+    }
+
+    pub fn wait(self: *WaitGroup) void {
+        self.mutex.lockUncancelable(self.io());
+        while (self.count.load(.acquire) > 0) {
+            self.cond.waitUncancelable(self.io(), &self.mutex);
+        }
+        self.mutex.unlock(self.io());
+    }
+
+    fn io(self: *WaitGroup) std.Io {
+        return self.io_impl.io();
+    }
+};
+
 pub const Task = struct {
     proc: *const fn (data: ?*anyopaque) void,
     data: ?*anyopaque = null,
@@ -55,8 +106,8 @@ pub const ThreadPool = struct {
 
     /// 실제 스폰된 워커 핸들
     workers: ?[]std.Thread = null,
-    /// task 큐 (FIFO). mutex로 보호.
-    tasks: std.ArrayList(Task) = .empty,
+    /// task 큐 (FIFO ring-buffer). mutex로 보호.
+    tasks: TaskQueue = .{},
     /// worker 사이 mutex.
     ///
     /// Zig 0.16의 조건 변수는 `std.Io.Condition`이며, 같은 Io mutex와 함께 사용한다.
@@ -155,7 +206,7 @@ pub const ThreadPool = struct {
 
         self.mutex.lockUncancelable(self.io());
         defer self.mutex.unlock(self.io());
-        self.tasks.append(self.allocator, task) catch return;
+        self.tasks.pushBack(self.allocator, task) catch return;
         self.cond.signal(self.io());
     }
 
@@ -187,8 +238,7 @@ fn workerLoop(pool: *ThreadPool) void {
             return;
         }
 
-        if (pool.tasks.items.len > 0) {
-            const task = pool.tasks.orderedRemove(0);
+        if (pool.tasks.popFront()) |task| {
 
             // task 실행 중에는 mutex 풀고, 끝나면 다시 lock.
             pool.mutex.unlock(pool.io());
@@ -200,6 +250,64 @@ fn workerLoop(pool: *ThreadPool) void {
         }
     }
 }
+
+const TaskQueue = struct {
+    buffer: []Task = &.{},
+    head: usize = 0,
+    len: usize = 0,
+
+    fn deinit(self: *TaskQueue, allocator: Allocator) void {
+        if (self.buffer.len != 0) {
+            allocator.free(self.buffer);
+        }
+        self.* = .{};
+    }
+
+    fn clearRetainingCapacity(self: *TaskQueue) void {
+        self.head = 0;
+        self.len = 0;
+    }
+
+    fn pushBack(self: *TaskQueue, allocator: Allocator, task: Task) !void {
+        if (self.len == self.buffer.len) {
+            try self.grow(allocator);
+        }
+
+        const index = (self.head + self.len) % self.buffer.len;
+        self.buffer[index] = task;
+        self.len += 1;
+    }
+
+    fn popFront(self: *TaskQueue) ?Task {
+        if (self.len == 0) return null;
+
+        const task = self.buffer[self.head];
+        self.head = (self.head + 1) % self.buffer.len;
+        self.len -= 1;
+        if (self.len == 0) {
+            self.head = 0;
+        }
+        return task;
+    }
+
+    fn grow(self: *TaskQueue, allocator: Allocator) !void {
+        const old_buffer = self.buffer;
+        const old_capacity = old_buffer.len;
+        const new_capacity = if (old_capacity == 0) 16 else old_capacity * 2;
+        const new_buffer = try allocator.alloc(Task, new_capacity);
+
+        var i: usize = 0;
+        while (i < self.len) : (i += 1) {
+            new_buffer[i] = old_buffer[(self.head + i) % old_capacity];
+        }
+
+        if (old_capacity != 0) {
+            allocator.free(old_buffer);
+        }
+        self.buffer = new_buffer;
+        self.head = 0;
+    }
+};
 
 pub const WorkerPoolOptions = struct {
     queue_capacity: usize = DefaultWorkerPoolQueueCapacity,
@@ -363,8 +471,18 @@ pub const WorkerPool = struct {
         self.started = false;
     }
 
+    /// ThreadPool과 동일한 fire-and-forget 시맨틱.
+    /// bounded queue 특성상 모든 큐가 가득 차면 worker가 slot을 비울 때까지
+    /// yield + 재시도한다 (무한정 블록되지 않도록 shutdown 감시 포함).
     pub fn addTask(self: *WorkerPool, task: Task) void {
-        _ = self.tryAddTask(task);
+        // early-exit: 워커가 없거나 시작 전이거나 shutdown 된 상태
+        if (self.n_jobs == 0 or !self.started or self.shutdown.load(.acquire)) return;
+
+        while (!self.tryAddTask(task)) {
+            // 재시도 루프 안에서도 shutdown이 선언되면 즉시 포기
+            if (self.shutdown.load(.acquire)) return;
+            std.Thread.yield() catch {};
+        }
     }
 
     pub fn stopTask(self: *WorkerPool, task: Task) void {
@@ -461,6 +579,7 @@ const AtomicTaskQueue = struct {
 
     fn tryPush(self: *AtomicTaskQueue, task: Task) bool {
         const capacity = self.slots.len;
+        if (capacity == 0) return false;
         var position = self.tail.load(.acquire);
         while (true) {
             if (position - self.head.load(.acquire) >= capacity) {
@@ -485,6 +604,7 @@ const AtomicTaskQueue = struct {
 
     fn tryPop(self: *AtomicTaskQueue) ?Task {
         const capacity = self.slots.len;
+        if (capacity == 0) return null;
         var position = self.head.load(.acquire);
         while (true) {
             const slot = &self.slots[position % capacity];
@@ -603,11 +723,11 @@ fn producerSubmitLoop(context: *ProducerSubmitContext) void {
 
 fn waitForCounter(counter: *std.atomic.Value(usize), expected: usize) !void {
     var attempts: usize = 0;
-    while (counter.load(.monotonic) < expected) : (attempts += 1) {
+    while (counter.load(.acquire) < expected) : (attempts += 1) {
         try std.Thread.yield();
         if (attempts > 1_000_000) break;
     }
-    try std.testing.expectEqual(expected, counter.load(.monotonic));
+    try std.testing.expectEqual(expected, counter.load(.acquire));
 }
 
 test "ThreadPool init stores config" {
@@ -715,6 +835,30 @@ test "ThreadPool join on not-started" {
     var pool = ThreadPool.init(std.heap.page_allocator, 0, &noOpWorker, null, &noOpWorker, null);
     pool.join(); // should not crash even if not started
     pool.deinit();
+}
+
+test "TaskQueue preserves FIFO across wrap and grow" {
+    var queue: TaskQueue = .{};
+    defer queue.deinit(std.testing.allocator);
+
+    try queue.pushBack(std.testing.allocator, .{ .proc = &testTask, .data = @ptrFromInt(@as(usize, 1)) });
+    try queue.pushBack(std.testing.allocator, .{ .proc = &testTask, .data = @ptrFromInt(@as(usize, 2)) });
+    try queue.pushBack(std.testing.allocator, .{ .proc = &testTask, .data = @ptrFromInt(@as(usize, 3)) });
+
+    try std.testing.expectEqual(@as(?*anyopaque, @ptrFromInt(@as(usize, 1))), queue.popFront().?.data);
+    try std.testing.expectEqual(@as(?*anyopaque, @ptrFromInt(@as(usize, 2))), queue.popFront().?.data);
+
+    var i: usize = 4;
+    while (i < 40) : (i += 1) {
+        try queue.pushBack(std.testing.allocator, .{ .proc = &testTask, .data = @ptrFromInt(i) });
+    }
+
+    try std.testing.expectEqual(@as(?*anyopaque, @ptrFromInt(@as(usize, 3))), queue.popFront().?.data);
+    i = 4;
+    while (i < 40) : (i += 1) {
+        try std.testing.expectEqual(@as(?*anyopaque, @ptrFromInt(i)), queue.popFront().?.data);
+    }
+    try std.testing.expectEqual(@as(?Task, null), queue.popFront());
 }
 
 test "WorkerPool init stores config" {
