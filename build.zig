@@ -1,7 +1,14 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
+pub fn defaultTargetQuery() std.Target.Query {
+    return if (builtin.target.os.tag == .windows) .{
+        .abi = .msvc,
+    } else .{};
+}
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    const target = b.standardTargetOptions(.{ .default_target = defaultTargetQuery() });
     const optimize = b.standardOptimizeOption(.{});
 
     const thread_pool_mod = b.addModule("thread_pool", .{
@@ -19,5 +26,4 @@ pub fn build(b: *std.Build) void {
 
     const check_step = b.step("check", "전체 컴파일 체크");
     check_step.dependOn(&run_tests.step);
-
 }
