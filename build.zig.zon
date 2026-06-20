@@ -1,9 +1,9 @@
 .{
     .minimum_zig_version = "0.16.0",
-    .name = .thread_pool,
-    .fingerprint = 0x2b20b508023f2d40,
+    .name = .utils,
+    .fingerprint = 0x540f5beb4fdd2ca4,
     .version = "0.1.0",
-    .description = "thread_pool — ThreadPool, WorkerPool",
+    .description = "utils — 공용 유틸리티 패키지",
     .copyright = "",
     .paths = .{
         "build.zig",

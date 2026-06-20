@@ -1,15 +1,20 @@
-//! thread_pool — Odin `core:thread.Pool` 1:1 매핑.
+//! utils — 공용 유틸리티 패키지.
+//!
+//! engine2 외부에서 함께 사용할 수 있는 스레드/동기화/할당 프리미티브 모음.
+//! - `ThreadPool` / `WorkerPool` / `Task` / `WaitGroup` — Odin `core:thread.Pool` 1:1 매핑.
+//! - `SpinLock` — atomic swap 기반 spinlock.
+//! - `SFL` — Segregated Free List 단일 스레드 할당자.
 //!
 //! ## 사용법
 //!
 //! ```zig
-//! const thread_pool = @import("thread_pool");
+//! const utils = @import("utils");
 //!
-//! var pool = thread_pool.ThreadPool.init(
+//! var pool = utils.ThreadPool.init(
 //!     allocator,
 //!     n_jobs,
-//!     worker_init, worker_init_data,
-//!     worker_fini, worker_fini_data,
+//!     utils.noOpWorker, null,
+//!     utils.noOpWorker, null,
 //! );
 //! try pool.start();
 //! defer pool.deinit();
@@ -38,6 +43,11 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+// ── 공용 유틸리티 re-export ──
+pub const SpinLock = @import("spin_lock.zig").SpinLock;
+pub const SFL = @import("sfl_allocator.zig").SFL;
+
+
 /// Go의 sync.WaitGroup과 동일한 패턴.
 /// - `add(n)`: 카운터 n 증가
 /// - `done()`: 카운터 1 감소. 0이 되면 대기 중인 wait()을 깨움
@@ -45,7 +55,7 @@ const Allocator = std.mem.Allocator;
 ///
 /// 사용 예:
 /// ```zig
-/// var wg = thread_pool.WaitGroup{};
+/// var wg = utils.WaitGroup{};
 /// wg.add(10);
 /// for (0..10) |_| {
 ///     try std.Thread.spawn(.{}, struct {
